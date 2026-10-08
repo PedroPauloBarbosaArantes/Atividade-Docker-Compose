@@ -1,0 +1,238 @@
+E-mail
+pedropaulobarbosa.pb@gmail.com
+
+Nome completo
+Pedro Paulo Barbosa Arantes
+
+RA
+253622492
+
+Código da aula
+08-10-compose-turma-b
+
+================================================================================
+Primeira execução
+================================================================================
+Comandos (ANTES de editar qualquer arquivo):
+
+  cd turma-b
+  docker compose up -d --build
+  docker compose ps -a
+  docker compose logs api
+  docker compose logs portal
+  curl.exe -sS -w "HTTP %{http_code}" http://localhost:8081/
+  curl.exe -sS -w "HTTP %{http_code}" http://localhost:8081/api/saude
+  curl.exe -sS -w "HTTP %{http_code}" http://localhost:8081/api/livros
+  docker compose exec portal cat /etc/nginx/conf.d/default.conf
+
+Saída de docker compose ps:
+
+  NAME               IMAGE            COMMAND                  SERVICE   CREATED         STATUS         PORTS
+  turma-b-api-1      turma-b-api      "docker-entrypoint.s…"   api       9 minutes ago   Up 9 minutes   3000/tcp
+  turma-b-portal-1   turma-b-portal   "/docker-entrypoint.…"   portal    9 minutes ago   Up 9 minutes   127.0.0.1:8081->80/tcp
+
+Os dois containers subiram. A API não publicou porta no host (apenas 3000/tcp interno). O portal publicou 127.0.0.1:8081->80/tcp.
+
+Trechos de log:
+
+  api-1  | {"evento":"inicio","porta":3001}
+
+  (nginx gerado no portal)
+  location /api/ {
+      set $destino http://127.0.0.1:3000;
+      rewrite ^/api/(.*)$ /$1 break;
+      proxy_pass $destino;
+  }
+
+  portal-1  | 2026/10/08 22:45:54 [error] 36#36: *1 connect() failed (111: Connection refused) while connecting to upstream, client: 172.18.0.1, server: , request: "GET /api/saude HTTP/1.1", upstream: "http://127.0.0.1:3000/saude", host: "localhost:8081"
+
+HTTP observado:
+  GET /            -> 200 (página HTML da biblioteca)
+  GET /api/saude   -> 502 Bad Gateway
+  GET /api/livros  -> 502 Bad Gateway
+
+O que a página mostrou (captura 08-10-compose-turma-b-primeira-execucao.png):
+  Turma B. Estado da API: Falha HTTP 502 em http://127.0.0.1:8081/api/saude
+  Livros: Falha HTTP 502 em http://127.0.0.1:8081/api/livros
+  Reservas registradas: Falha HTTP 502 em http://127.0.0.1:8081/api/reservas
+  Tabela de livros vazia (select sem opções).
+
+================================================================================
+Falhas encontradas
+================================================================================
+
+Falha 1 — proxy do portal aponta para 127.0.0.1 em vez do serviço api
+
+Sintoma: página em :8081 abre, mas /api/* devolve 502. Estado da API não fica "ok".
+
+Comando/log da causa:
+  docker compose exec portal cat /etc/nginx/conf.d/default.conf
+    set $destino http://127.0.0.1:3000;
+  docker compose logs portal
+    connect() failed (111: Connection refused) ... upstream: "http://127.0.0.1:3000/saude"
+
+Causa: API_URL=http://127.0.0.1:3000. Dentro do container portal, 127.0.0.1 é o próprio Nginx, não a API. Na rede do Compose o hostname correto é o nome do serviço (api).
+
+Hipótese testada e descartada: containers não estavam rodando. docker compose ps mostrou os dois Up. A página HTTP 200 confirma que o portal atende.
+
+Alteração: API_URL: "http://api:3000"
+
+---
+
+Falha 2 — porta da API (3001) diferente da porta usada pelo portal (3000)
+
+Sintoma: depois de corrigir só o hostname, /api/saude continuou 502.
+
+Comando/log da causa:
+  docker compose logs api
+    {"evento":"inicio","porta":3001}
+  docker compose logs portal (após API_URL=http://api:3000)
+    connect() failed (111: Connection refused) ... upstream: "http://172.18.0.2:3000/saude"
+
+Causa: o Nginx passou a resolver o serviço api (IP 172.18.0.2), mas tentou a porta 3000. A API escuta em PORT=3001.
+
+Hipótese testada e descartada: o nome DNS "api" não existiria. O log mostra upstream no IP do container da API (172.18.0.2), então a resolução funcionou; o recusou foi a porta.
+
+Alteração: PORT: "3000" (alinhado ao Dockerfile EXPOSE 3000 e ao API_URL).
+
+Depois disso:
+  GET /api/saude  -> 200 {"status":"ok","turma":"B"}
+  GET /api/livros -> 200 com total: 3 e os três títulos.
+
+---
+
+Falha 3 — reservas não sobrevivem a docker compose down / up
+
+Sintoma: POST /api/reservas retornou 201 e a página listou a reserva, reduzindo restantes de 3 para 2. Após docker compose down e docker compose up -d, GET /api/reservas voltou [].
+
+Comando/log da causa:
+  (antes do volume nomeado)
+  GET /api/reservas após down/up -> []  HTTP 200
+  A API grava em /app/registros/reservas.json (server.ts). O compose só montava ./dados:/app/dados:ro. docker compose down apaga o filesystem do container.
+
+Hipótese testada e descartada: o bind :ro de dados impediria gravar a reserva. A gravação é em /app/registros, não em dados. O POST 201 com o volume ainda inexistente mostrou que a escrita no diretório interno do container funcionava; o que falhava era a persistência entre down/up.
+
+Hipótese descartada também: publicar a porta da API. docker compose ps manteve a API só em 3000/tcp interno. curl em 127.0.0.1:3000 e :3001 falhou (Could not connect), atendendo o critério 4.
+
+Alteração: volume nomeado registros montado em /app/registros.
+
+================================================================================
+Conteúdo final do compose.yaml
+================================================================================
+services:
+  api:
+    build: ./api
+    environment:
+      PORT: "3000"
+    volumes:
+      - ./dados:/app/dados:ro
+      - registros:/app/registros
+  portal:
+    build: ./portal
+    ports:
+      - "127.0.0.1:8081:80"
+    environment:
+      API_URL: "http://api:3000"
+    depends_on:
+      - api
+
+volumes:
+  registros:
+
+================================================================================
+Verificação dos critérios
+================================================================================
+
+Critério 1 — http://localhost:8081 mostra estado da API ok e tabela com três livros
+
+docker compose ps:
+  turma-b-api-1      ... Up ... 3000/tcp
+  turma-b-portal-1   ... Up ... 127.0.0.1:8081->80/tcp
+
+GET http://127.0.0.1:8081/api/saude
+{
+  "status": "ok",
+  "turma": "B"
+}
+
+GET http://127.0.0.1:8081/api/livros  (trecho)
+  "total": 3
+  "Redes de computadores", "Sistemas operacionais", "Engenharia de software"
+
+Página: "Estado da API: ok" e tabela com os três livros.
+Captura: 08-10-compose-turma-b-criterio1-e-2.png
+
+Critério 2 — reserva RA-CODIGO na página, aparece em Reservas registradas e reduz exemplares
+
+POST http://127.0.0.1:8081/api/reservas
+{"livroId":1,"nome":"253622492-08-10-compose-turma-b"}
+HTTP 201
+{
+  "livroId": 1,
+  "nome": "253622492-08-10-compose-turma-b",
+  "criadaEm": "2026-10-08T22:56:10.722Z"
+}
+
+GET /api/livros: Redes de computadores disponiveis 3, reservados 1, restantes 2
+GET /api/reservas: lista com 253622492-08-10-compose-turma-b no livro 1
+Página: "Reservas registradas" com o mesmo nome.
+Captura: 08-10-compose-turma-b-criterio2-reservas.png
+
+Critério 3 — reserva permanece após down seguido de up
+
+Comandos:
+  docker compose down
+    Container turma-b-portal-1 Removed
+    Container turma-b-api-1 Removed
+    Network turma-b_default Removed
+    (volume turma-b_registros permanece)
+
+  docker compose up -d
+    Network turma-b_default Created
+    Container turma-b-api-1 Started
+    Container turma-b-portal-1 Started
+
+  docker volume ls
+    local     turma-b_registros
+
+GET http://127.0.0.1:8081/api/reservas  (depois do up)
+[
+  {
+    "livroId": 1,
+    "nome": "253622492-08-10-compose-turma-b",
+    "criadaEm": "2026-10-08T22:56:10.722Z"
+  }
+]
+HTTP 200
+
+Página após recarregar: mesma reserva e restantes 2 em Redes de computadores.
+Captura: 08-10-compose-turma-b-criterio3-apos-down-up.png
+
+Critério 4 (confirmado, sem porta da API no host):
+  curl.exe http://127.0.0.1:3000/saude -> Failed to connect
+  curl.exe http://127.0.0.1:3001/saude -> Failed to connect
+
+================================================================================
+Link das evidências
+================================================================================
+NÃO há Google Drive nem GitHub CLI nesta máquina para publicar o link automaticamente.
+Suba a pasta turma-b/evidencias (ou a pasta turma-b inteira) no Drive, compartilhe para leitura com pedro.satin@unicesumar.edu.br, confira o acesso e cole o link aqui.
+
+Arquivos da entrega (código da aula no nome ou em identificacao.txt):
+  compose.yaml (final)
+  identificacao.txt
+  evidencias/08-10-compose-turma-b-compose.yaml
+  evidencias/08-10-compose-turma-b-primeira-execucao.png
+  evidencias/08-10-compose-turma-b-criterio1-e-2.png
+  evidencias/08-10-compose-turma-b-criterio2-reservas.png
+  evidencias/08-10-compose-turma-b-criterio3-apos-down-up.png
+  mais saídas de comando em evidencias/*.txt e *.json
+
+================================================================================
+Problema de infraestrutura ou observação
+================================================================================
+Os containers da primeira execução já estavam "Running" (imagens em cache); mesmo assim os logs, o ps e a página com 502 foram registrados ANTES de qualquer edição no compose.yaml.
+
+Não foi possível gerar o link do Drive daqui: não há sessão Google nem gh nesta máquina. O envio do link depende de você compartilhar a pasta e confirmar o acesso do professor.
+
+Ao terminar a coleta das capturas, o projeto foi encerrado com docker compose down, conforme o enunciado. O volume turma-b_registros permanece no Docker até um down -v; isso é esperado para o critério 3.
